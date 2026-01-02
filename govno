@@ -1,0 +1,456 @@
+import asyncio
+import logging
+import re
+import time
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict, Tuple
+
+import requests
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+logging.basicConfig(level=logging.INFO)
+
+# ======================
+# НАСТРОЙКИ
+# ======================
+BOT_TOKEN = "PASTE_YOUR_TOKEN_HERE"
+
+POST_URL = "https://intranetdmc.com/test.php"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
+    )
+}
+
+# Если сервер ожидает JSON вместо form-data, поставьте True
+SEND_AS_JSON = False
+
+MAX_QUANTITY = 10
+SEND_COOLDOWN_SECONDS = 15
+PREVIEW_LIMIT = 800
+
+# Если True — удаляем сообщение пользователя даже при ошибке валидации
+DELETE_ON_INVALID = False
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+_last_send_at: Dict[int, float] = {}
+
+
+# ======================
+# FSM
+# ======================
+class MailFlow(StatesGroup):
+    waiting_value = State()
+
+
+# ======================
+# ДАННЫЕ ЧЕРНОВИКА
+# ======================
+@dataclass
+class Draft:
+    to: Optional[str] = None
+    domain: Optional[str] = None
+    from_name: Optional[str] = None
+    subject: Optional[str] = None
+    message: Optional[str] = None
+    quantity: Optional[int] = None
+
+    pending_field: Optional[str] = None
+    prompt_message_id: Optional[int] = None
+    panel_message_id: Optional[int] = None
+
+
+FIELDS = [
+    ("to", "Получатель"),
+    ("domain", "Домен"),
+    ("from_name", "Отправитель (до @)"),
+    ("subject", "Тема"),
+    ("message", "Текст письма"),
+    ("quantity", "Количество писем"),
+]
+
+
+# ======================
+# ВСПОМОГАТЕЛЬНОЕ
+# ======================
+def load_draft(data: dict) -> Draft:
+    d = data.get("draft")
+    if isinstance(d, dict):
+        return Draft(**d)
+    return Draft()
+
+
+async def save_draft(state: FSMContext, d: Draft):
+    await state.update_data(draft=asdict(d))
+
+
+def complete(d: Draft) -> bool:
+    return all([
+        d.to,
+        d.domain,
+        d.from_name,
+        d.subject,
+        d.message,
+        isinstance(d.quantity, int) and d.quantity > 0
+    ])
+
+
+def validate(field: str, value: str) -> Tuple[bool, str]:
+    v = (value or "").strip()
+
+    if field == "to":
+        if not EMAIL_RE.match(v):
+            return False, "Некорректный email получателя."
+        return True, v
+
+    if field == "domain":
+        if not v.startswith("@") or " " in v or len(v) < 3:
+            return False, "Домен должен начинаться с @ и не содержать пробелов."
+        return True, v
+
+    if field == "from_name":
+        if "@" in v or " " in v or len(v) < 1:
+            return False, "Отправитель — только часть до @."
+        return True, v
+
+    if field == "subject":
+        if len(v) < 1:
+            return False, "Тема не может быть пустой."
+        return True, v
+
+    if field == "message":
+        if len(v) < 1:
+            return False, "Текст письма не может быть пустым."
+        return True, v
+
+    if field == "quantity":
+        try:
+            q = int(v)
+        except ValueError:
+            return False, "Количество должно быть числом."
+        if q < 1:
+            return False, "Количество должно быть не меньше 1."
+        if q > MAX_QUANTITY:
+            return False, f"Максимальное количество: {MAX_QUANTITY}."
+        return True, str(q)
+
+    return False, "Неизвестное поле."
+
+
+def preview(d: Draft) -> str:
+    msg = d.message or "—"
+    if d.message and len(d.message) > PREVIEW_LIMIT:
+        msg = d.message[:PREVIEW_LIMIT] + "..."
+
+    status = "Все поля заполнены. Можно отправлять." if complete(d) else "Заполните все поля."
+
+    return (
+        "Черновик письма:\n\n"
+        f"Получатель: {d.to or '—'}\n"
+        f"Домен: {d.domain or '—'}\n"
+        f"Отправитель (до @): {d.from_name or '—'}\n"
+        f"Тема: {d.subject or '—'}\n"
+        f"Текст: {msg}\n"
+        f"Количество: {d.quantity if d.quantity is not None else '—'}\n\n"
+        f"{status}"
+    )
+
+
+def kb_main(d: Draft):
+    kb = InlineKeyboardBuilder()
+    for key, title in FIELDS:
+        filled = getattr(d, key) is not None
+        kb.button(
+            text=f"{'Готово' if filled else 'Изменить'}: {title}",
+            callback_data=f"edit:{key}"
+        )
+    kb.adjust(1)
+
+    kb.row()
+    kb.button(text="Отправить", callback_data="send", disabled=not complete(d))
+    kb.button(text="Новый черновик", callback_data="new")
+    kb.button(text="Отмена", callback_data="cancel")
+    kb.adjust(1, 2, 1)
+    return kb.as_markup()
+
+
+def kb_confirm():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Подтвердить отправку", callback_data="confirm")
+    kb.button(text="Назад", callback_data="back")
+    kb.button(text="Отмена", callback_data="cancel")
+    kb.adjust(1, 1, 1)
+    return kb.as_markup()
+
+
+def cooldown_ok(user_id: int) -> Tuple[bool, int]:
+    now = time.time()
+    last = _last_send_at.get(user_id, 0.0)
+    remain = int(SEND_COOLDOWN_SECONDS - (now - last))
+    return (remain <= 0, max(remain, 0))
+
+
+def mark_sent(user_id: int):
+    _last_send_at[user_id] = time.time()
+
+
+async def safe_delete_message(bot: Bot, chat_id: int, message_id: int):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def render_panel(bot: Bot, chat_id: int, d: Draft, state: FSMContext, header: Optional[str] = None):
+    text = preview(d) if not header else f"{header}\n\n{preview(d)}"
+
+    if d.panel_message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=d.panel_message_id,
+                text=text,
+                reply_markup=kb_main(d)
+            )
+            return
+        except Exception:
+            d.panel_message_id = None
+            await save_draft(state, d)
+
+    msg = await bot.send_message(chat_id, text, reply_markup=kb_main(d))
+    d.panel_message_id = msg.message_id
+    await save_draft(state, d)
+
+
+async def render_confirm(bot: Bot, chat_id: int, d: Draft, state: FSMContext):
+    text = "Подтвердите отправку:\n\n" + preview(d)
+
+    if d.panel_message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=d.panel_message_id,
+                text=text,
+                reply_markup=kb_confirm()
+            )
+            return
+        except Exception:
+            d.panel_message_id = None
+            await save_draft(state, d)
+
+    msg = await bot.send_message(chat_id, text, reply_markup=kb_confirm())
+    d.panel_message_id = msg.message_id
+    await save_draft(state, d)
+
+
+def do_post(d: Draft) -> Tuple[bool, str]:
+    payload = {
+        "to": d.to,
+        "domain": d.domain,
+        "from": d.from_name,          # ключ строго "from"
+        "subject": d.subject,
+        "message": d.message,
+        "quantity": str(d.quantity),
+    }
+
+    try:
+        if SEND_AS_JSON:
+            r = requests.post(POST_URL, headers=HEADERS, json=payload, timeout=20)
+        else:
+            r = requests.post(POST_URL, headers=HEADERS, data=payload, timeout=20)
+
+        logging.info("POST %s -> HTTP %s", POST_URL, r.status_code)
+        logging.info("Response (first 500): %s", (r.text or "")[:500])
+
+        if 200 <= r.status_code < 300:
+            return True, f"Отправлено. HTTP {r.status_code}."
+        return False, f"Ошибка отправки. HTTP {r.status_code}. Ответ: {(r.text or '')[:500]}"
+    except Exception as e:
+        logging.exception("POST exception")
+        return False, f"Исключение при отправке: {e}"
+
+
+# ======================
+# BOT
+# ======================
+dp = Dispatcher()
+
+
+@dp.message(CommandStart())
+async def start(message: Message, state: FSMContext):
+    data = await state.get_data()
+    d = load_draft(data)
+    if data.get("draft") is None:
+        await save_draft(state, d)
+
+    await render_panel(
+        bot=message.bot,
+        chat_id=message.chat.id,
+        d=d,
+        state=state,
+        header="Здравствуйте.\n\nЗаполните поля кнопками ниже. После заполнения нажмите «Отправить»."
+    )
+
+
+@dp.callback_query(F.data == "new")
+async def new_draft(cb: CallbackQuery, state: FSMContext):
+    old = load_draft(await state.get_data())
+    panel_id = old.panel_message_id
+
+    await state.clear()
+    d = Draft(panel_message_id=panel_id)
+    await save_draft(state, d)
+
+    await render_panel(cb.message.bot, cb.message.chat.id, d, state, header="Создан новый черновик.")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "cancel")
+async def cancel(cb: CallbackQuery, state: FSMContext):
+    old = load_draft(await state.get_data())
+    panel_id = old.panel_message_id
+
+    await state.clear()
+    d = Draft(panel_message_id=panel_id)
+    await save_draft(state, d)
+
+    await render_panel(cb.message.bot, cb.message.chat.id, d, state, header="Отменено. Черновик сброшен.")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "back")
+async def back(cb: CallbackQuery, state: FSMContext):
+    d = load_draft(await state.get_data())
+    await render_panel(cb.message.bot, cb.message.chat.id, d, state)
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("edit:"))
+async def edit(cb: CallbackQuery, state: FSMContext):
+    d = load_draft(await state.get_data())
+
+    field = cb.data.split(":", 1)[1]
+    titles = dict(FIELDS)
+    if field not in titles:
+        await cb.answer("Неизвестное поле.", show_alert=True)
+        return
+
+    d.pending_field = field
+    await save_draft(state, d)
+    await state.set_state(MailFlow.waiting_value)
+
+    current = getattr(d, field) or "—"
+    prompt_msg = await cb.message.answer(
+        f"Введите значение для поля: {titles[field]}\n\n"
+        f"Текущее значение: {current}\n\n"
+        "Отправьте одним сообщением."
+    )
+
+    d.prompt_message_id = prompt_msg.message_id
+    await save_draft(state, d)
+    await cb.answer()
+
+
+@dp.message(MailFlow.waiting_value)
+async def set_value(message: Message, state: FSMContext):
+    bot = message.bot
+    d = load_draft(await state.get_data())
+
+    if not d.pending_field:
+        await state.set_state(None)
+        return
+
+    ok, cleaned = validate(d.pending_field, message.text or "")
+    if not ok:
+        if DELETE_ON_INVALID:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+        await message.answer(cleaned)
+        return
+
+    if d.pending_field == "quantity":
+        setattr(d, d.pending_field, int(cleaned))
+    else:
+        setattr(d, d.pending_field, cleaned)
+
+    d.pending_field = None
+    await save_draft(state, d)
+    await state.set_state(None)
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    if d.prompt_message_id:
+        await safe_delete_message(bot, message.chat.id, d.prompt_message_id)
+        d.prompt_message_id = None
+        await save_draft(state, d)
+
+    await render_panel(bot, message.chat.id, d, state)
+
+
+@dp.callback_query(F.data == "send")
+async def send(cb: CallbackQuery, state: FSMContext):
+    d = load_draft(await state.get_data())
+
+    if not complete(d):
+        await cb.answer("Заполнены не все поля.", show_alert=True)
+        return
+
+    ok_cd, remain = cooldown_ok(cb.from_user.id)
+    if not ok_cd:
+        await cb.answer(f"Подождите {remain} сек.", show_alert=True)
+        return
+
+    await render_confirm(cb.message.bot, cb.message.chat.id, d, state)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "confirm")
+async def confirm(cb: CallbackQuery, state: FSMContext):
+    d = load_draft(await state.get_data())
+
+    if not complete(d):
+        await cb.answer("Заполнены не все поля.", show_alert=True)
+        return
+
+    ok_cd, remain = cooldown_ok(cb.from_user.id)
+    if not ok_cd:
+        await cb.answer(f"Подождите {remain} сек.", show_alert=True)
+        return
+
+    ok, info = do_post(d)
+
+    if ok:
+        mark_sent(cb.from_user.id)
+        panel_id = d.panel_message_id
+
+        await state.clear()
+        d = Draft(panel_message_id=panel_id)
+        await save_draft(state, d)
+
+        await render_panel(cb.message.bot, cb.message.chat.id, d, state, header=f"{info}\n\nЧерновик очищен.")
+    else:
+        await render_panel(cb.message.bot, cb.message.chat.id, d, state, header=info)
+
+    await cb.answer()
+
+
+async def main():
+    bot = Bot(BOT_TOKEN)
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
